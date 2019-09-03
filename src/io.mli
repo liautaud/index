@@ -1,49 +1,17 @@
 module type S = sig
-  type t
+  type 'a t
 
-  val v :
-    readonly:bool ->
-    fresh:bool ->
-    generation:int64 ->
-    fan_size:int64 ->
-    string ->
-    t
+  val v : string -> [`Read | `Write] t
 
-  val name : t -> string
+  val v_rdonly : string -> [`Read] t
 
-  val offset : t -> int64
+  val read : [> `Read] t -> off:int64 -> bytes -> int
 
-  val force_offset : t -> int64
+  val write : [> `Write] t -> off:int64 -> bytes -> unit
 
-  val readonly : t -> bool
+  val rename : [> `Write] t -> string -> unit
 
-  val read : t -> off:int64 -> bytes -> int
+  val close : [`Read | `Write] t -> unit
 
-  val clear : t -> unit
-
-  val sync : t -> unit
-
-  val version : t -> string
-
-  val set_generation : t -> int64 -> unit
-
-  val get_generation : t -> int64
-
-  val set_fanout : t -> string -> unit
-
-  val get_fanout : t -> string
-
-  val rename : src:t -> dst:t -> unit
-
-  val append : t -> string -> unit
-
-  val close : t -> unit
-
-  val valid_fd : t -> bool
-
-  type lock
-
-  val lock : string -> lock
-
-  val unlock : lock -> unit
+  val is_valid : [> `Read] t -> bool
 end
