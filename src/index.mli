@@ -60,8 +60,6 @@ module type Value = sig
   val pp : t Fmt.t
 end
 
-module type IO = Io.S
-
 exception RO_not_allowed
 (** The exception raised when illegal operation is attempted on a read_only
     index. *)
@@ -119,7 +117,7 @@ module type S = sig
       and value of [t]. *)
 end
 
-module Make (K : Key) (V : Value) (IO : IO) :
+module Make (K : Key) (V : Value) (FS : Fs.Raw) :
   S with type key = K.t and type value = V.t
 
 (** These modules should not be used. They are exposed purely for testing purposes. *)

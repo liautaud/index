@@ -33,8 +33,6 @@ module type Value = sig
   val pp : t Fmt.t
 end
 
-module type IO = Io.S
-
 module type S = sig
   type t
 
@@ -73,7 +71,9 @@ let src = Logs.Src.create "index" ~doc:"Index"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-module Make (K : Key) (V : Value) (IO : IO) = struct
+module Make (K : Key) (V : Value) (Raw : Fs.Raw) = struct
+  module FS = Fs.Make(Raw)
+
   type key = K.t
 
   type value = V.t
@@ -95,8 +95,8 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
       raise (Invalid_key_size e.key);
     if String.length encoded_value <> V.encoded_size then
       raise (Invalid_value_size e.value);
-    IO.append io encoded_key;
-    IO.append io encoded_value
+    FS.append io encoded_key;
+    FS.append io encoded_value
 
   let decode_entry bytes off =
     let string = Bytes.unsafe_to_string bytes in
@@ -108,28 +108,27 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
 
   type config = { log_size : int; readonly : bool }
 
-  type index = { io : IO.t; fan_out : Fan.t }
+  type index = { io : FS.t; fan_out : Fan.t }
 
   type t = {
     config : config;
     root : string;
     mutable generation : int64;
     mutable index : index option;
-    log : IO.t;
+    log : FS.t;
     log_mem : entry Tbl.t;
     mutable counter : int;
-    lock : IO.lock;
   }
 
   let clear t =
     Log.debug (fun l -> l "clear %S" t.root);
     t.generation <- 0L;
-    IO.clear t.log;
+    FS.clear t.log;
     Tbl.clear t.log_mem;
     may
       (fun i ->
-        IO.clear i.io;
-        IO.close i.io)
+        FS.clear i.io;
+        FS.close i.io)
       t.index;
     t.index <- None
 
@@ -141,21 +140,19 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
 
   let index_path root = index_dir root // "data"
 
-  let lock_path root = index_dir root // "lock"
-
   let merge_path root = index_dir root // "merge"
 
   let page_size = Int64.mul entry_sizeL 1_000L
 
   let iter_io_off ?(min = 0L) ?max f io =
-    let max = match max with None -> IO.offset io | Some m -> m in
+    let max = match max with None -> FS.offset io | Some m -> m in
     let rec aux offset =
       let remaining = Int64.sub max offset in
       if remaining <= 0L then ()
       else
         let size = Stdlib.min remaining page_size in
         let raw = Bytes.create (Int64.to_int size) in
-        let n = IO.read io ~off:offset raw in
+        let n = FS.read io ~off:offset raw in
         let rec read_page page off =
           if off = n then ()
           else
@@ -181,16 +178,16 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     let to_value e = e.value
   end
 
-  module IOArray = struct
+  module FSArray = struct
     type buffer = { buf : bytes; low_off : int64; high_off : int64 }
 
-    type t = { io : IO.t; mutable buffer : buffer option }
+    type t = { io : FS.t; mutable buffer : buffer option }
 
     let v io = { io; buffer = None }
 
     let get_entry_from_io io off =
       let buf = Bytes.create entry_size in
-      let n = IO.read io ~off buf in
+      let n = FS.read io ~off buf in
       assert (n = entry_size);
       decode_entry buf 0
 
@@ -216,14 +213,14 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
           try get_entry_from_buffer b off with _ -> assert false )
       | _ -> get_entry_from_io t.io off
 
-    let length t = Int64.(div (IO.offset t.io) entry_sizeL)
+    let length t = Int64.(div (FS.offset t.io) entry_sizeL)
 
     let set_buffer t ~low ~high =
       let range = entry_size * (1 + Int64.to_int (high -- low)) in
       let low_off = Int64.mul low entry_sizeL in
       let high_off = Int64.mul high entry_sizeL in
       let buf = Bytes.create range in
-      let n = IO.read t.io ~off:low_off buf in
+      let n = FS.read t.io ~off:low_off buf in
       assert (n = range);
       t.buffer <- Some { buf; low_off; high_off }
 
@@ -262,7 +259,7 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
   end
 
   module Search =
-    Search.Make (Entry) (IOArray)
+    Search.Make (Entry) (FSArray)
       (struct
         type t = int
 
@@ -301,7 +298,7 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
           Hashtbl.remove roots (root, false);
           raise Not_found );
         let t = Hashtbl.find roots (root, readonly) in
-        if IO.valid_fd t.log then (
+        if t.counter <> 0 then (
           Log.debug (fun l -> l "%s found in cache" root);
           t.counter <- t.counter + 1;
           if fresh then clear t;
@@ -320,24 +317,23 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     `Staged f
 
   let v_no_cache ~fresh ~readonly ~log_size root =
-    let lock = IO.lock (lock_path root) in
     let config = { log_size = log_size * entry_size; readonly } in
     let log_path = log_path root in
     let index_path = index_path root in
     let log_mem = Tbl.create 1024 in
-    let log = IO.v ~fresh ~readonly ~generation:0L ~fan_size:0L log_path in
-    let generation = IO.get_generation log in
+    let log = FS.v ~fresh ~readonly ~generation:0L ~fan_size:0L log_path in
+    let generation = FS.get_generation log in
     let index =
       if Sys.file_exists index_path then
         let io =
-          IO.v ~fresh ~readonly ~generation:0L ~fan_size:0L index_path
+          FS.v ~fresh ~readonly ~generation:0L ~fan_size:0L index_path
         in
-        let fan_out = Fan.import ~hash_size:K.hash_size (IO.get_fanout io) in
+        let fan_out = Fan.import ~hash_size:K.hash_size (FS.get_fanout io) in
         Some { fan_out; io }
       else None
     in
     iter_io (fun e -> Tbl.replace log_mem e.key e) log;
-    { config; generation; log_mem; root; log; index; counter = 1; lock }
+    { config; generation; log_mem; root; log; index; counter = 1 }
 
   let (`Staged v) = with_cache ~v:v_no_cache ~clear
 
@@ -347,25 +343,26 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     let low, high =
       Int64.(div low_bytes entry_sizeL, div high_bytes entry_sizeL)
     in
-    Search.interpolation_search (IOArray.v index.io) key ~low ~high
+    Search.interpolation_search (FSArray.v index.io) key ~low ~high
 
   let sync_log t =
-    let generation = IO.get_generation t.log in
-    let log_offset = IO.offset t.log in
-    let new_log_offset = IO.force_offset t.log in
+    let generation = FS.get_generation t.log in
+    let log_offset = FS.offset t.log in
+    let () = FS.force_offset t.log in
+    let new_log_offset = FS.offset t.log in
     let add_log_entry e = Tbl.replace t.log_mem e.key e in
     if t.generation <> generation then (
       Tbl.clear t.log_mem;
       iter_io add_log_entry t.log;
-      may (fun i -> IO.close i.io) t.index;
+      may (fun i -> FS.close i.io) t.index;
       if Int64.equal generation 0L then t.index <- None
       else
         let index_path = index_path t.root in
         let io =
-          IO.v ~fresh:false ~readonly:true ~generation ~fan_size:0L index_path
+          FS.v ~fresh:false ~readonly:true ~generation ~fan_size:0L index_path
         in
         let fan_out =
-          Fan.import ~hash_size:K.encoded_size (IO.get_fanout io)
+          Fan.import ~hash_size:K.encoded_size (FS.get_fanout io)
         in
         t.index <- Some { fan_out; io };
         t.generation <- generation )
@@ -391,11 +388,11 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     match find t key with _ -> true | exception Not_found -> false
 
   let append_buf_fanout fan_out hash buf_str dst_io =
-    Fan.update fan_out hash (IO.offset dst_io);
-    IO.append dst_io buf_str
+    Fan.update fan_out hash (FS.offset dst_io);
+    FS.append dst_io buf_str
 
   let append_entry_fanout fan_out entry dst_io =
-    Fan.update fan_out entry.key_hash (IO.offset dst_io);
+    Fan.update fan_out entry.key_hash (FS.offset dst_io);
     append_entry dst_io entry
 
   let rec merge_from_log fan_out log log_i hash_e dst_io =
@@ -417,8 +414,8 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
   let merge_with log index dst_io =
     let entries = 10_000 in
     let buf = Bytes.create (entries * entry_size) in
-    let refill off = ignore (IO.read index.io ~off buf) in
-    let index_end = IO.offset index.io in
+    let refill off = ignore (FS.read index.io ~off buf) in
+    let index_end = FS.offset index.io in
     let fan_out = index.fan_out in
     refill 0L;
     let rec go index_offset buf_offset log_i =
@@ -467,19 +464,19 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
       match t.index with
       | None -> Tbl.length t.log_mem
       | Some index ->
-          (Int64.to_int (IO.offset index.io) / entry_size)
+          (Int64.to_int (FS.offset index.io) / entry_size)
           + Tbl.length t.log_mem
     in
     let fan_out = Fan.v ~hash_size:K.hash_size ~entry_size fan_size in
     let merge =
-      IO.v ~readonly:false ~fresh:true ~generation
+      FS.v ~readonly:false ~fresh:true ~generation
         ~fan_size:(Int64.of_int (Fan.exported_size fan_out))
         merge_path
     in
     ( match t.index with
     | None ->
         let io =
-          IO.v ~fresh:true ~readonly:false ~generation:0L ~fan_size:0L
+          FS.v ~fresh:true ~readonly:false ~generation:0L ~fan_size:0L
             (index_path t.root)
         in
         append_remaining_log fan_out log 0 merge;
@@ -492,11 +489,11 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     | None -> assert false
     | Some index ->
         Fan.finalize index.fan_out;
-        IO.set_fanout merge (Fan.export index.fan_out);
-        IO.rename ~src:merge ~dst:index.io;
-        IO.clear t.log;
+        FS.set_fanout merge (Fan.export index.fan_out);
+        FS.rename ~src:merge ~dst:index.io;
+        FS.clear t.log;
         Tbl.clear t.log_mem;
-        IO.set_generation t.log generation;
+        FS.set_generation t.log generation;
         t.generation <- generation
 
   let force_merge t key value =
@@ -509,7 +506,7 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     let entry = { key; key_hash = K.hash key; value } in
     append_entry t.log entry;
     Tbl.replace t.log_mem key entry;
-    if Int64.compare (IO.offset t.log) (Int64.of_int t.config.log_size) > 0
+    if Int64.compare (FS.offset t.log) (Int64.of_int t.config.log_size) > 0
     then merge ~witness:entry t
 
   (* XXX: Perform a merge beforehands to ensure duplicates are not hit twice. *)
@@ -517,16 +514,15 @@ module Make (K : Key) (V : Value) (IO : IO) = struct
     Tbl.iter (fun _ e -> f e.key e.value) t.log_mem;
     may (fun index -> iter_io (fun e -> f e.key e.value) index.io) t.index
 
-  let flush t = IO.sync t.log
+  let flush t = FS.sync t.log
 
   let close t =
     t.counter <- t.counter - 1;
     if t.counter = 0 then (
       Log.debug (fun l -> l "close %S" t.root);
       if not t.config.readonly then flush t;
-      IO.close t.log;
-      may (fun i -> IO.close i.io) t.index;
+      FS.close t.log;
+      may (fun i -> FS.close i.io) t.index;
       t.index <- None;
-      Tbl.reset t.log_mem;
-      IO.unlock t.lock )
+      Tbl.reset t.log_mem )
 end
